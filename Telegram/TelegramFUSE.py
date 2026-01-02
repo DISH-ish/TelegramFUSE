@@ -47,12 +47,14 @@ class TelegramFileClient():
 
         # file_bytes is bytesio obj
         file_bytes = bytesio.read()
-        total_size = len(file_bytes)
+        original_size = len(file_bytes)
         
         if self.encryption_key is not None:
-            print(f"Encrypting {file_name or fh} ({total_size} bytes)")
+            print(f"Encrypting {file_name or fh}: {original_size} bytes -> ", end="")
             f = Fernet(bytes(self.encryption_key, 'utf-8'))
             file_bytes = f.encrypt(file_bytes)
+            encrypted_size = len(file_bytes)
+            print(f"{encrypted_size} bytes (+{encrypted_size - original_size} bytes overhead)")
 
         chunks = []
         file_len = len(file_bytes)
