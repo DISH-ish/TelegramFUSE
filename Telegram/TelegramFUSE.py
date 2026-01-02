@@ -104,12 +104,12 @@ class TelegramFileClient():
             
     print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
             
-            f = self.client.upload_file(chunk, file_name=chunk_name, 
-                                       part_size_kb=512, 
-                                       progress_callback=chunk_progress_cb)
-            result = self.client.send_file(self.channel_entity, f)
-            upload_results.append(result)
-            uploaded_bytes += chunk_size
+    f = self.client.upload_file(chunk, file_name=chunk_name, 
+                                part_size_kb=512, 
+                                progress_callback=chunk_progress_cb)
+    result = self.client.send_file(self.channel_entity, f)
+    upload_results.append(result)
+    uploaded_bytes += chunk_size
         
         if 'pbar' in locals():
             pbar.close()
