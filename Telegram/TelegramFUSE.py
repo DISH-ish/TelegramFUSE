@@ -9,6 +9,7 @@ from collections import defaultdict
 from cachetools import LRUCache, TTLCache
 import gc
 import time
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -34,7 +35,7 @@ class TelegramFileClient():
         
         # Use TTLCache for automatic expiration
         self.cached_files = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL, getsizeof=getsizeofelt)
-        self.fname_to_msgs = defaultdict(tuple)
+        self.fname_to_msgs = aultdict(tuple)
 
         print(f"Cache configured: maxsize={CACHE_MAXSIZE}, TTL={CACHE_TTL}s")
         print(f"Using encryption: {self.encryption_key is not None}")
@@ -81,16 +82,22 @@ class TelegramFileClient():
         for i, chunk in enumerate(chunks):
             chunk_name = f"{fname}_part{i}.txt"
             
-            # Create progress callback for this chunk
-            def make_chunk_progress_callback(chunk_index, chunk_size):
-                def chunk_progress(sent_bytes, _):
-                    nonlocal uploaded_bytes
-                    # Calculate overall progress
-                    if progress_callback:
-                        # The uploaded_bytes variable tracks bytes from previous chunks
-                        overall_sent = uploaded_bytes - chunk_size + sent_bytes
-                        progress_callback(overall_sent, total_size)
-                return chunk_progress
+    if not progress_callback:
+        pbar = tqdm(total=original_size, 
+                desc=f"Uploading '{file_name or fh[:20]}'",
+                unit='B', 
+                unit_scale=True, 
+                unit_divisor=1024)
+        def progress_callback(sent_bytes, total):
+        pbar.update(sent_bytes - pbar.n)
+
+    def make_chunk_progress_callback(chunk_index, chunk_size):
+        def chunk_progress(sent_bytes, _):
+            nonlocal uploaded_bytes
+            if progress_callback:
+                overall_sent = uploaded_bytes - chunk_size + sent_bytes
+                progress_callback(overall_sent, original_size)
+        return chunk_progress
             
             chunk_size = len(chunk)
             chunk_progress_cb = make_chunk_progress_callback(i, chunk_size) if progress_callback else None
@@ -103,7 +110,11 @@ class TelegramFileClient():
             result = self.client.send_file(self.channel_entity, f)
             upload_results.append(result)
             uploaded_bytes += chunk_size
-
+        
+        if 'pbar' in locals():
+            pbar.close()
+            print(f"Upload complete: {original_size} bytes")
+            
         self.fname_to_msgs[file_name] = tuple([m.id for m in upload_results])
         
         # Only cache if file is not too large
@@ -139,26 +150,31 @@ class TelegramFileClient():
             if hasattr(m, 'document') and hasattr(m.document, 'size'):
                 total_size += m.document.size
         
+        if total_size > 0:
+            pbar = tqdm(total=total_size,
+                        desc=f"Downloading file",
+                        unit='B',
+                        unit_scale=True,
+                        unit_divisor=1024)
+
         for i, m in enumerate(msgs):
             part_size = m.document.size if (hasattr(m, 'document') and hasattr(m.document, 'size')) else 0
-            print(f"Downloading part {i+1}/{len(msgs)} ({part_size} bytes)")
-            
+    
             # Create progress callback for this part
-            def make_download_progress_callback(part_index, part_total):
-                last_reported = [0]
+            last_received = [0]
+            def make_part_progress_callback():
                 def progress_callback(received_bytes, total):
-                    nonlocal downloaded_size
-                    if total > 0:
-                        percent = int((received_bytes / total) * 100)
-                        if percent >= last_reported[0] + 10:  # Report every 10%
-                            print(f"Part {part_index+1}: {percent}%")
-                            last_reported[0] = percent
+                    if 'pbar' in locals() and received_bytes > last_received[0]:
+                        pbar.update(received_bytes - last_received[0])
+                        last_received[0] = received_bytes
                 return progress_callback
-            
-            progress_cb = make_download_progress_callback(i, part_size) if part_size > 0 else None
+    
+            progress_cb = make_part_progress_callback() if part_size > 0 else None
             result = self.download_message(m, progress_callback=progress_cb)
             buf.write(result)
-            downloaded_size += len(result)
+
+        if 'pbar' in locals():
+            pbar.close()
         
         numBytes = buf.getbuffer().nbytes
         print(f"Downloaded file {fh} is {numBytes} bytes")
