@@ -55,19 +55,22 @@ class TelegramFileClient():
             file_bytes = f.encrypt(file_bytes)
             encrypted_size = len(file_bytes)
             print(f"{encrypted_size} bytes (+{encrypted_size - original_size} bytes overhead)")
+        else:
+            encrypted_size = original_size
+
+        # Total size is the encrypted size (or original if no encryption)
+        total_upload_size = len(file_bytes)
 
         chunks = []
-        file_len = len(file_bytes)
-
-        if file_len > FILE_MAX_SIZE_BYTES:
+        if total_upload_size > FILE_MAX_SIZE_BYTES:
             # Calculate the number of chunks needed
-            num_chunks = (file_len + FILE_MAX_SIZE_BYTES - 1) // FILE_MAX_SIZE_BYTES
+            num_chunks = (total_upload_size + FILE_MAX_SIZE_BYTES - 1) // FILE_MAX_SIZE_BYTES
             print(f"Splitting file into {num_chunks} chunks")
             
             # Split the file into chunks
             for i in range(num_chunks):
                 start = i * FILE_MAX_SIZE_BYTES
-                end = min((i + 1) * FILE_MAX_SIZE_BYTES, file_len)
+                end = min((i + 1) * FILE_MAX_SIZE_BYTES, total_upload_size)
                 chunk = file_bytes[start:end]
                 chunks.append(chunk)
         else:
@@ -80,20 +83,30 @@ class TelegramFileClient():
         uploaded_bytes = 0
         for i, chunk in enumerate(chunks):
             chunk_name = f"{fname}_part{i}.txt"
-            
-            # Create progress callback for this chunk
-            def make_chunk_progress_callback(chunk_index, chunk_size):
-                def chunk_progress(sent_bytes, _):
-                    nonlocal uploaded_bytes
-                    # Calculate overall progress
-                    if progress_callback:
-                        # The uploaded_bytes variable tracks bytes from previous chunks
-                        overall_sent = uploaded_bytes - chunk_size + sent_bytes
-                        progress_callback(overall_sent, total_size)
-                return chunk_progress
-            
             chunk_size = len(chunk)
-            chunk_progress_cb = make_chunk_progress_callback(i, chunk_size) if progress_callback else None
+            
+            # Create progress callback for this chunk with proper closure
+            if progress_callback:
+                # Use a lambda with default arguments to capture current values
+                def make_progress_callback(current_chunk_size, chunk_idx, 
+                                         uploaded_so_far=uploaded_bytes, 
+                                         total=total_upload_size):
+                    last_reported = [0]
+                    def chunk_progress(sent_bytes, _):
+                        nonlocal uploaded_so_far
+                        # Calculate overall progress
+                        overall_sent = uploaded_so_far - current_chunk_size + sent_bytes
+                        percent = int((overall_sent / total) * 100)
+                        if percent >= last_reported[0] + 10:  # Report every 10%
+                            print(f"Uploading {fname}: {percent}%")
+                            last_reported[0] = percent
+                        if progress_callback:
+                            progress_callback(overall_sent, total)
+                    return chunk_progress
+                
+                chunk_progress_cb = make_progress_callback(chunk_size, i)
+            else:
+                chunk_progress_cb = None
             
             print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
             
@@ -107,11 +120,11 @@ class TelegramFileClient():
         self.fname_to_msgs[file_name] = tuple([m.id for m in upload_results])
         
         # Only cache if file is not too large
-        if total_size <= CACHE_MAX_FILE_SIZE:
+        if total_upload_size <= CACHE_MAX_FILE_SIZE:
             self.cached_files[fh] = file_bytes
-            print(f"Cached file {fh} ({total_size} bytes). Cache size: {self.cached_files.currsize}/{self.cached_files.maxsize}")
+            print(f"Cached file {fh} ({total_upload_size} bytes). Cache size: {self.cached_files.currsize}/{self.cached_files.maxsize}")
         else:
-            print(f"File {fh} too large for cache ({total_size} > {CACHE_MAX_FILE_SIZE})")
+            print(f"File {fh} too large for cache ({total_upload_size} > {CACHE_MAX_FILE_SIZE})")
         
         return upload_results
 
@@ -131,31 +144,33 @@ class TelegramFileClient():
         
         msgs = self.get_messages(msgIds)
         buf = BytesIO()
-        total_size = 0
+        total_encrypted_size = 0
         downloaded_size = 0
         
         # Try to get total size from messages
         for m in msgs:
             if hasattr(m, 'document') and hasattr(m.document, 'size'):
-                total_size += m.document.size
+                total_encrypted_size += m.document.size
         
         for i, m in enumerate(msgs):
             part_size = m.document.size if (hasattr(m, 'document') and hasattr(m.document, 'size')) else 0
             print(f"Downloading part {i+1}/{len(msgs)} ({part_size} bytes)")
             
-            # Create progress callback for this part
-            def make_download_progress_callback(part_index, part_total):
-                last_reported = [0]
-                def progress_callback(received_bytes, total):
-                    nonlocal downloaded_size
-                    if total > 0:
+            # Create progress callback for this part with proper closure
+            if part_size > 0:
+                def make_progress_callback(part_idx, part_total):
+                    last_reported = [0]
+                    def progress_callback(received_bytes, total):
                         percent = int((received_bytes / total) * 100)
                         if percent >= last_reported[0] + 10:  # Report every 10%
-                            print(f"Part {part_index+1}: {percent}%")
+                            print(f"Part {part_idx+1}: {percent}%")
                             last_reported[0] = percent
-                return progress_callback
+                    return progress_callback
+                
+                progress_cb = make_progress_callback(i, part_size)
+            else:
+                progress_cb = None
             
-            progress_cb = make_download_progress_callback(i, part_size) if part_size > 0 else None
             result = self.download_message(m, progress_callback=progress_cb)
             buf.write(result)
             downloaded_size += len(result)
@@ -173,6 +188,7 @@ class TelegramFileClient():
         barr = bytearray(readBytes)
         
         # Only cache if file is not too large
+        # Note: We cache the encrypted data, so use encrypted size
         if numBytes <= CACHE_MAX_FILE_SIZE:
             self.cached_files[fh] = barr
             print(f"Cached downloaded file {fh}")
