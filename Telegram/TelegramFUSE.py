@@ -99,10 +99,10 @@ class TelegramFileClient():
                 progress_callback(overall_sent, original_size)
         return chunk_progress
             
-            chunk_size = len(chunk)
-            chunk_progress_cb = make_chunk_progress_callback(i, chunk_size) if progress_callback else None
+    chunk_size = len(chunk)
+    chunk_progress_cb = make_chunk_progress_callback(i, chunk_size) if progress_callback else None
             
-            print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
+    print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
             
             f = self.client.upload_file(chunk, file_name=chunk_name, 
                                        part_size_kb=512, 
