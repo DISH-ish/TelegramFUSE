@@ -89,7 +89,7 @@ class TelegramFileClient():
                 unit_scale=True, 
                 unit_divisor=1024)
         def progress_callback(sent_bytes, total):
-        pbar.update(sent_bytes - pbar.n)
+            pbar.update(sent_bytes - pbar.n)
 
     def make_chunk_progress_callback(chunk_index, chunk_size):
         def chunk_progress(sent_bytes, _):
