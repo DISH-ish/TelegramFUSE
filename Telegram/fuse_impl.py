@@ -491,7 +491,7 @@ class Operations(pyfuse3.Operations):
     async def close(self, fh):
         pass
 
-    async def fsync(self, fh):
+    async def fsync(self, fh, ctx):
         pass
 
     async def release(self, fh):
