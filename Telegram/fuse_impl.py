@@ -22,6 +22,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import os
 import sys
+import threading
+import hashlib
 
 # If we are running from the pyfuse3 source directory, try
 # to load the module from there first.
@@ -64,10 +66,14 @@ class Operations(pyfuse3.Operations):
         self.cursor = self.db.cursor()
         self.inode_open_count = defaultdict(int)
         self.client = client
-        # buffer data for writes. BYTEARRAY ONLY. I really wanted this to be a dictionary to support multiple files
-        # at once, but I had crazy memory management issues with dictionaries (even cachetools, even though we clear entries)
-        # so just a buffer.
-        self.write_buffer = bytearray(b'')
+        
+        # Per-file write buffers with locking
+        self.write_buffers = {}  # fh -> bytearray
+        self.buffer_locks = defaultdict(threading.Lock)  # fh -> Lock
+        
+        # Progress tracking
+        self.write_progress = {}  # fh -> (current, total)
+        
         try:
             # Check if inodes table exists
             self.cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("inodes",))
@@ -81,18 +87,8 @@ class Operations(pyfuse3.Operations):
         except Exception as e:
             print(f"Error checking if table exists: {e}")
 
-    # debug. shows contents of tables
-    def load_tables(self):
-        self.cursor.execute("SELECT * FROM inodes;")
-        rows = self.cursor.fetchall()
-        print(f"GOT {len(rows)} inodes")
-        print(" id   guid    gid mode    mtime_ns    atime_ns    ctime_ns    target  size    rdev    data")
-        for row in rows:
-            print("Row: ", "    ".join([str(r) for r in row]))
-
     def init_tables(self):
         '''Initialize file system tables'''
-
         self.cursor.execute("""
         CREATE TABLE inodes (
             id        INTEGER PRIMARY KEY,
@@ -102,10 +98,11 @@ class Operations(pyfuse3.Operations):
             mtime_ns  INT NOT NULL,
             atime_ns  INT NOT NULL,
             ctime_ns  INT NOT NULL,
-            target    BLOB(256) ,
+            target    BLOB(256),
             size      INT NOT NULL DEFAULT 0,
             rdev      INT NOT NULL DEFAULT 0,
-            data      BLOB
+            data      BLOB,
+            checksum  TEXT
         )
         """)
 
@@ -113,7 +110,8 @@ class Operations(pyfuse3.Operations):
         self.cursor.execute("""
         CREATE TABLE telegram_messages (
             id INTEGER PRIMARY KEY,
-            inode INT NOT NULL REFERENCES inodes(id)
+            inode INT NOT NULL REFERENCES inodes(id),
+            part_index INT NOT NULL DEFAULT 0
         )
         """)
 
@@ -123,7 +121,6 @@ class Operations(pyfuse3.Operations):
             name      BLOB(256) NOT NULL,
             inode     INT NOT NULL REFERENCES inodes(id),
             parent_inode INT NOT NULL REFERENCES inodes(id),
-
             UNIQUE (name, parent_inode)
         )""")
 
@@ -139,7 +136,6 @@ class Operations(pyfuse3.Operations):
         
         self.db.commit()
 
-
     def get_row(self, *a, **kw):
         self.cursor.execute(*a, **kw)
         try:
@@ -152,16 +148,13 @@ class Operations(pyfuse3.Operations):
             pass
         else:
             raise NoUniqueValueError()
-
         return row
 
     def get_rows(self, *a, **kw):
         self.cursor.execute(*a, **kw)
         rows = self.cursor.fetchall()
-
         if not rows:
             raise NoSuchRowError()
-
         return rows
 
     async def lookup(self, inode_p, name, ctx=None):
@@ -176,9 +169,7 @@ class Operations(pyfuse3.Operations):
                                      (name, inode_p))['inode']
             except NoSuchRowError:
                 raise(pyfuse3.FUSEError(errno.ENOENT))
-
         return await self.getattr(inode, ctx)
-
 
     async def getattr(self, inode, ctx=None):
         try:
@@ -322,7 +313,6 @@ class Operations(pyfuse3.Operations):
 
         self.db.commit()
 
-
     async def link(self, inode, new_inode_p, new_name, ctx):
         entry_p = await self.getattr(new_inode_p)
         if entry_p.st_nlink == 0:
@@ -336,7 +326,6 @@ class Operations(pyfuse3.Operations):
         return await self.getattr(inode)
 
     async def setattr(self, inode, attr, fields, fh, ctx):
-
         if fields.update_size:
             # get data from telegram
             data = await self.get_telegram_data(fh)
@@ -403,21 +392,13 @@ class Operations(pyfuse3.Operations):
         return stat_
 
     async def open(self, inode, flags, ctx):
-        # Yeah, unused arguments
-        #pylint: disable=W0613
         self.inode_open_count[inode] += 1
-
-        # Use inodes as a file handles
         return pyfuse3.FileInfo(fh=inode)
 
     async def access(self, inode, mode, ctx):
-        # Yeah, could be a function and has unused arguments
-        #pylint: disable=R0201,W0613
         return True
 
     async def create(self, inode_parent, name, mode, flags, ctx):
-        
-        #pylint: disable=W0612
         entry = await self._create(inode_parent, name, mode, ctx)
         self.inode_open_count[entry.st_ino] += 1
         return (pyfuse3.FileInfo(fh=entry.st_ino), entry)
@@ -440,53 +421,65 @@ class Operations(pyfuse3.Operations):
         self.db.commit()
         return await self.getattr(inode)
 
-    # helper function to get all data for a file from telegram
     async def get_telegram_data(self, fh):
         filebuf = self.client.get_cached_file(fh)
-        if filebuf != None:
+        if filebuf is not None:
             return filebuf
-        # CHECK if we have ANY messages for this inode
+        
         try:
-            # get telegram messages for inode
-            msgIds = self.get_rows('SELECT * FROM telegram_messages WHERE inode=?', (fh,))
+            msgIds = self.get_rows('SELECT * FROM telegram_messages WHERE inode=? ORDER BY part_index', (fh,))
             ids = [r[0] for r in msgIds]
 
-            # FOR EACH message, call telegram API and get contents
-            filebuf = self.client.download_file(fh, ids)
-            return filebuf
-        # if no rows, return empty bytes immediately
-        except Exception as e:
-            print("EXCEPTION: ", e)
-            return bytearray(b'')
+            if not ids:
+                return bytearray(b'')
 
+            filebuf = self.client.download_file(fh, ids)
+            
+            # Verify checksum if available
+            row = self.get_row('SELECT checksum FROM inodes WHERE id=?', (fh,))
+            if row and row['checksum']:
+                computed_checksum = hashlib.sha256(filebuf).hexdigest()
+                if computed_checksum != row['checksum']:
+                    log.error(f"Checksum mismatch for inode {fh}. Expected {row['checksum']}, got {computed_checksum}")
+                    # We could retry here, but for now just log the error
+                    
+            return filebuf
+        except Exception as e:
+            log.error(f"Exception in get_telegram_data for inode {fh}: {e}")
+            return bytearray(b'')
 
     async def read(self, fh, offset, length):
         row = self.get_row('SELECT * FROM inodes WHERE id=?', (fh,))
-
-        # if no data, don't query telegram
         if row is None:
             return b''
 
         telegram_data = await self.get_telegram_data(fh)
         return telegram_data[offset:offset+length]
 
-    # buffer in memory first...
     async def write(self, fh, offset, buf):
-        # get data if exists
-        result_bytes = self.write_buffer
-
-        # if we are not already writing, try to get data from telegram
-        if result_bytes == bytearray(b''):
-            row = self.get_row('SELECT * FROM inodes WHERE id=?', (fh,))
-            if row != None:
-                result_bytes = await self.get_telegram_data(fh)
-                self.write_buffer = result_bytes
-        if offset == len(result_bytes):
-            self.write_buffer += buf
-        else:
-            self.write_buffer = result_bytes[:offset] + buf + result_bytes[offset+len(buf):] # this is kind of slow
-
-        return len(buf)
+        with self.buffer_locks[fh]:
+            if fh not in self.write_buffers:
+                # Initialize buffer with existing data if any
+                existing_data = await self.get_telegram_data(fh)
+                self.write_buffers[fh] = bytearray(existing_data)
+                self.write_progress[fh] = (0, len(buf))
+            
+            result_bytes = self.write_buffers[fh]
+            
+            # Update progress
+            if fh in self.write_progress:
+                current, total = self.write_progress[fh]
+                self.write_progress[fh] = (current + len(buf), total)
+            
+            if offset == len(result_bytes):
+                self.write_buffers[fh] += buf
+            else:
+                # Ensure buffer is large enough
+                if offset + len(buf) > len(result_bytes):
+                    self.write_buffers[fh] = result_bytes.ljust(offset + len(buf), b'\x00')
+                self.write_buffers[fh][offset:offset+len(buf)] = buf
+            
+            return len(buf)
 
     async def close(self, fh):
         pass
@@ -496,37 +489,67 @@ class Operations(pyfuse3.Operations):
 
     async def release(self, fh):
         self.inode_open_count[fh] -= 1
-        # THIS is where we write data for real!
-        # IF we have un-written data in the buffer for this fh, yeet it to discord/tgram.
-        if len(self.write_buffer) > 0:
-            data = self.write_buffer
-            self.write_buffer = bytearray(b'')
-            # self.write_buffer.pop(fh)
-            print("CLEANED UP ", gc.collect())
-            filename = ""
+        
+        # Clean up buffer if it exists
+        with self.buffer_locks[fh]:
+            if fh in self.write_buffers and len(self.write_buffers[fh]) > 0:
+                data = self.write_buffers.pop(fh)
+                
+                # Calculate checksum before encryption
+                checksum = hashlib.sha256(data).hexdigest()
+                
+                if fh in self.write_progress:
+                    del self.write_progress[fh]
+                
+                filename = ""
+                try:
+                    fname = self.get_row("SELECT name FROM contents WHERE inode=?", (fh,))
+                    if fname:
+                        name = fname[0]
+                        filename = name.decode('utf-8', errors='ignore')
+                except Exception as e:
+                    log.error(f"Error getting filename for inode {fh}: {e}")
+                
+                # Update checksum in database
+                self.cursor.execute('UPDATE inodes SET checksum=? WHERE id=?', (checksum, fh))
+                
+                # Write data back to telegram with progress callback
+                fileBytes = BytesIO(data)
+                total_size = len(data)
+                
+                # Create progress callback
+                def upload_progress_callback(sent_bytes, _):
+                    percent = int((sent_bytes / total_size) * 100)
+                    if percent % 10 == 0:  # Report every 10%
+                        print(f"Uploading {filename}: {percent}% ({sent_bytes}/{total_size} bytes)")
+                
+                telegram_msgs = self.client.upload_file(fileBytes, fh, filename, 
+                                                       progress_callback=upload_progress_callback)
 
-            fname = self.get_row("SELECT name FROM contents WHERE inode=?", (fh,))
-            if fname != None:
-                name = fname[0]
-                filename = name.decode()
-            # write data back to telegram
-            fileBytes = BytesIO(data)
-            telegram_msgs = self.client.upload_file(fileBytes, fh, filename)
+                # Clear existing from telegram
+                self.delete_msgs_for_inode(fh)
 
-            # clear existing from telegram
-            self.delete_msgs_for_inode(fh)
+                # Clear any existing messages from DB
+                self.cursor.execute("DELETE FROM telegram_messages WHERE inode = ?", (fh,))
 
-            # clear any existing messages from DB
-            self.cursor.execute("DELETE FROM telegram_messages WHERE inode = ?", (fh,))
+                # Add new message ids back to DB with part indices
+                for idx, msg in enumerate(telegram_msgs):
+                    self.cursor.execute("INSERT INTO telegram_messages (id, inode, part_index) VALUES (?, ?, ?)", 
+                                       (msg.id, fh, idx))
 
-            # add new message ids back to DB
-            for msg in telegram_msgs:
-                self.cursor.execute("INSERT INTO telegram_messages (id, inode) VALUES (?, ?)", (msg.id, fh,))
-
-            # update inodes
-            self.cursor.execute('UPDATE inodes SET size=? WHERE id=?',
-                                (len(data), fh))
-            self.db.commit()
+                # Update inodes
+                self.cursor.execute('UPDATE inodes SET size=? WHERE id=?', (len(data), fh))
+                self.db.commit()
+                
+                print(f"✓ File {filename} uploaded successfully ({len(data)} bytes)")
+            
+            # Clean up empty buffers
+            if fh in self.write_buffers and len(self.write_buffers[fh]) == 0:
+                del self.write_buffers[fh]
+        
+        # Clean up lock if no longer needed
+        if fh in self.buffer_locks and fh not in self.write_buffers:
+            del self.buffer_locks[fh]
 
         if self.inode_open_count[fh] == 0:
             del self.inode_open_count[fh]
@@ -537,7 +560,6 @@ class Operations(pyfuse3.Operations):
 class NoUniqueValueError(Exception):
     def __str__(self):
         return 'Query generated more than 1 result row'
-
 
 class NoSuchRowError(Exception):
     def __str__(self):
@@ -559,16 +581,13 @@ def init_logging(debug=False):
 
 def parse_args():
     '''Parse command line'''
-
     parser = ArgumentParser()
-
     parser.add_argument('mountpoint', type=str,
                         help='Where to mount the file system', default="./telegramfs")
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Enable debugging output')
     parser.add_argument('--debug-fuse', action='store_true', default=False,
                         help='Enable FUSE debugging output')
-
     return parser.parse_args()
 
 def runFs(client):
@@ -598,5 +617,3 @@ def runFs(client):
 
     except:
         raise
-    
-    
