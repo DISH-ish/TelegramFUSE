@@ -79,32 +79,43 @@ class TelegramFileClient():
 
         upload_results = []
         fname = file_name or f"file_{fh}"
-
-        uploaded_bytes = 0
+        
+        uploaded_so_far = [0]  # Use list for mutability
+        
         for i, chunk in enumerate(chunks):
             chunk_name = f"{fname}_part{i}.txt"
             chunk_size = len(chunk)
             
-            # Create progress callback for this chunk with proper closure
+            print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
+            
             if progress_callback:
-                # Use a lambda with default arguments to capture current values
-                def make_progress_callback(current_chunk_size, chunk_idx, 
-                                         uploaded_so_far=uploaded_bytes, 
-                                         total=total_upload_size):
+                # Capture current values for this chunk
+                current_chunk_start = uploaded_so_far[0]
+                
+                def create_progress_callback(chunk_start, fname, original, encrypted, total):
                     last_reported = [0]
                     def chunk_progress(sent_bytes, _):
-                        nonlocal uploaded_so_far
-                        # Calculate overall progress
-                        overall_sent = uploaded_so_far - current_chunk_size + sent_bytes
+                        overall_sent = chunk_start + sent_bytes
                         percent = int((overall_sent / total) * 100)
-                        if percent >= last_reported[0] + 10:  # Report every 10%
-                            print(f"Uploading {fname}: {percent}%")
+                        if original != encrypted:
+                            display_sent = int(overall_sent * (original / encrypted))
+                            if display_sent > original:
+                                display_sent = original
+                        else:
+                            display_sent = overall_sent
+                        
+                        # Report progress every 10%
+                        if percent >= last_reported[0] + 10:
+                            print(f"Uploading {fname}: {percent}% ({display_sent}/{original} bytes)")
                             last_reported[0] = percent
-                        if progress_callback:
-                            progress_callback(overall_sent, total)
+                        progress_callback(overall_sent, total)
+                    
                     return chunk_progress
                 
-                chunk_progress_cb = make_progress_callback(chunk_size, i)
+                chunk_progress_cb = create_progress_callback(
+                    current_chunk_start, fname, original_size, 
+                    encrypted_size, total_upload_size
+                )
             else:
                 chunk_progress_cb = None
             
@@ -115,7 +126,7 @@ class TelegramFileClient():
                                        progress_callback=chunk_progress_cb)
             result = self.client.send_file(self.channel_entity, f)
             upload_results.append(result)
-            uploaded_bytes += chunk_size
+            uploaded_so_far[0] += chunk_size
 
         self.fname_to_msgs[file_name] = tuple([m.id for m in upload_results])
         
