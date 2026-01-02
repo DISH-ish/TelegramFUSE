@@ -35,7 +35,7 @@ class TelegramFileClient():
         
         # Use TTLCache for automatic expiration
         self.cached_files = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL, getsizeof=getsizeofelt)
-        self.fname_to_msgs = aultdict(tuple)
+        self.fname_to_msgs = defaultdict(tuple)  # Fixed typo: aultdict -> defaultdict
 
         print(f"Cache configured: maxsize={CACHE_MAXSIZE}, TTL={CACHE_TTL}s")
         print(f"Using encryption: {self.encryption_key is not None}")
@@ -78,39 +78,42 @@ class TelegramFileClient():
         upload_results = []
         fname = file_name or f"file_{fh}"
 
+        # Set up progress bar if no callback provided
+        if not progress_callback:
+            pbar = tqdm(total=original_size, 
+                    desc=f"Uploading '{file_name or fh[:20]}'",
+                    unit='B', 
+                    unit_scale=True, 
+                    unit_divisor=1024)
+            def progress_callback(sent_bytes, total):
+                pbar.update(sent_bytes - pbar.n)
+
         uploaded_bytes = 0
         for i, chunk in enumerate(chunks):
             chunk_name = f"{fname}_part{i}.txt"
+            chunk_size = len(chunk)
             
-    if not progress_callback:
-        pbar = tqdm(total=original_size, 
-                desc=f"Uploading '{file_name or fh[:20]}'",
-                unit='B', 
-                unit_scale=True, 
-                unit_divisor=1024)
-        def progress_callback(sent_bytes, total):
-            pbar.update(sent_bytes - pbar.n)
-
-    def make_chunk_progress_callback(chunk_index, chunk_size):
-        def chunk_progress(sent_bytes, _):
-            nonlocal uploaded_bytes
-            if progress_callback:
-                overall_sent = uploaded_bytes - chunk_size + sent_bytes
-                progress_callback(overall_sent, original_size)
-        return chunk_progress
+            # Create progress callback for this chunk
+            def make_chunk_progress_callback(chunk_index, chunk_size):
+                def chunk_progress(sent_bytes, _):
+                    nonlocal uploaded_bytes
+                    if progress_callback:
+                        overall_sent = uploaded_bytes - chunk_size + sent_bytes
+                        progress_callback(overall_sent, original_size)
+                return chunk_progress
             
-    chunk_size = len(chunk)
-    chunk_progress_cb = make_chunk_progress_callback(i, chunk_size) if progress_callback else None
+            chunk_progress_cb = make_chunk_progress_callback(i, chunk_size) if progress_callback else None
             
-    print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
+            print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
             
-    f = self.client.upload_file(chunk, file_name=chunk_name, 
-                                part_size_kb=512, 
-                                progress_callback=chunk_progress_cb)
-    result = self.client.send_file(self.channel_entity, f)
-    upload_results.append(result)
-    uploaded_bytes += chunk_size
+            f = self.client.upload_file(chunk, file_name=chunk_name, 
+                                       part_size_kb=512, 
+                                       progress_callback=chunk_progress_cb)
+            result = self.client.send_file(self.channel_entity, f)
+            upload_results.append(result)
+            uploaded_bytes += chunk_size
         
+        # Close progress bar if we created one
         if 'pbar' in locals():
             pbar.close()
             print(f"Upload complete: {original_size} bytes")
@@ -118,11 +121,11 @@ class TelegramFileClient():
         self.fname_to_msgs[file_name] = tuple([m.id for m in upload_results])
         
         # Only cache if file is not too large
-        if total_size <= CACHE_MAX_FILE_SIZE:
+        if original_size <= CACHE_MAX_FILE_SIZE:  # Changed from total_size to original_size
             self.cached_files[fh] = file_bytes
-            print(f"Cached file {fh} ({total_size} bytes). Cache size: {self.cached_files.currsize}/{self.cached_files.maxsize}")
+            print(f"Cached file {fh} ({original_size} bytes). Cache size: {self.cached_files.currsize}/{self.cached_files.maxsize}")
         else:
-            print(f"File {fh} too large for cache ({total_size} > {CACHE_MAX_FILE_SIZE})")
+            print(f"File {fh} too large for cache ({original_size} > {CACHE_MAX_FILE_SIZE})")
         
         return upload_results
 
@@ -150,6 +153,7 @@ class TelegramFileClient():
             if hasattr(m, 'document') and hasattr(m.document, 'size'):
                 total_size += m.document.size
         
+        # Create progress bar if we have a total size
         if total_size > 0:
             pbar = tqdm(total=total_size,
                         desc=f"Downloading file",
@@ -173,6 +177,7 @@ class TelegramFileClient():
             result = self.download_message(m, progress_callback=progress_cb)
             buf.write(result)
 
+        # Close progress bar if we created one
         if 'pbar' in locals():
             pbar.close()
         
