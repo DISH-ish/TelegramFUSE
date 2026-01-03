@@ -1,6 +1,7 @@
 import logging
 logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.DEBUG)
 from telethon import TelegramClient, events, sync, utils
+from telethon.errors import FloodWaitError, RpcError, RpcTimeoutError, ServerError
 from dotenv import load_dotenv
 import os
 from io import BytesIO
@@ -9,6 +10,7 @@ from collections import defaultdict
 from cachetools import LRUCache, TTLCache
 import gc
 import time
+import sys
 
 load_dotenv()
 
@@ -17,6 +19,8 @@ FILE_MAX_SIZE_BYTES = int(2 * 1e9)  # 2GB
 CACHE_MAXSIZE = 1e9  # 1GB cache
 CACHE_MAX_FILE_SIZE = 100 * 1024 * 1024  # Don't cache files larger than 100MB
 CACHE_TTL = 300  # 5 minutes TTL for cached items
+MAX_RETRIES = 3  # Maximum number of retries for failed operations
+RETRY_DELAY = 5  # Base delay between retries in seconds
 
 def getsizeofelt(val):
     try:
@@ -38,6 +42,44 @@ class TelegramFileClient():
 
         print(f"Cache configured: maxsize={CACHE_MAXSIZE}, TTL={CACHE_TTL}s")
         print(f"Using encryption: {self.encryption_key is not None}")
+
+    def _handle_telegram_error(self, error, operation_name, attempt):
+        #Handle Telegram API errors with appropriate retry logic.
+        if isinstance(error, FloodWaitError):
+            wait_time = error.seconds
+            print(f"Telegram FloodWaitError for {operation_name} (attempt {attempt}): Need to wait {wait_time} seconds")
+            print(f"Waiting {wait_time} seconds before retrying...")
+            time.sleep(wait_time + 1)  # Add 1 second buffer
+            return True  # Retry
+        elif isinstance(error, (RpcTimeoutError, ServerError)):
+            # Network or server errors - retry with exponential backoff
+            delay = RETRY_DELAY * (2 ** (attempt - 1))
+            print(f"Telegram {error.__class__.__name__} for {operation_name} (attempt {attempt}): Retrying in {delay} seconds...")
+            time.sleep(delay)
+            return True  # Retry
+        elif isinstance(error, RpcError):
+            # Other RPC errors - log and don't retry
+            print(f"Telegram RpcError for {operation_name}: {error}")
+            return False  # Don't retry
+        else:
+            # Unknown error
+            print(f"Unknown error for {operation_name}: {error}")
+            return False  # Don't retry
+
+    def _retry_operation(self, operation, operation_name, *args, **kwargs):
+        """Retry an operation with exponential backoff and error handling."""
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return operation(*args, **kwargs)
+            except (FloodWaitError, RpcError, RpcTimeoutError, ServerError) as e:
+                should_retry = self._handle_telegram_error(e, operation_name, attempt)
+                if not should_retry or attempt == MAX_RETRIES:
+                    raise
+            except Exception as e:
+                print(f"Non-Telegram error in {operation_name} (attempt {attempt}): {e}")
+                if attempt == MAX_RETRIES:
+                    raise
+                time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
 
     def upload_file(self, bytesio, fh, file_name=None, progress_callback=None):
         # Invalidate cache as soon as we upload file
@@ -119,12 +161,32 @@ class TelegramFileClient():
             else:
                 chunk_progress_cb = None
             
-            print(f"Uploading chunk {i+1}/{len(chunks)} ({chunk_size} bytes)")
+            # Use retry wrapper for upload operations
+            try:
+                f = self._retry_operation(
+                    self.client.upload_file,
+                    f"upload_chunk_{i}",
+                    chunk, 
+                    file_name=chunk_name, 
+                    part_size_kb=512, 
+                    progress_callback=chunk_progress_cb
+                )
+                
+                result = self._retry_operation(
+                    self.client.send_file,
+                    f"send_chunk_{i}",
+                    self.channel_entity, 
+                    f
+                )
+                
+            except Exception as e:
+                print(f"Failed to upload chunk {i+1}/{len(chunks)} after {MAX_RETRIES} attempts: {e}")
+                # If this is not the first chunk, we should clean up previously uploaded chunks
+                if i > 0:
+                    print(f"Cleaning up {i} previously uploaded chunks...")
+                    self._cleanup_partial_upload(upload_results)
+                raise
             
-            f = self.client.upload_file(chunk, file_name=chunk_name, 
-                                       part_size_kb=512, 
-                                       progress_callback=chunk_progress_cb)
-            result = self.client.send_file(self.channel_entity, f)
             upload_results.append(result)
             uploaded_so_far[0] += chunk_size
 
@@ -138,6 +200,21 @@ class TelegramFileClient():
             print(f"File {fh} too large for cache ({total_upload_size} > {CACHE_MAX_FILE_SIZE})")
         
         return upload_results
+
+    def _cleanup_partial_upload(self, uploaded_messages):
+        #Clean up partially uploaded messages if upload fails.
+        try:
+            if uploaded_messages:
+                message_ids = [msg.id for msg in uploaded_messages]
+                self._retry_operation(
+                    self.client.delete_messages,
+                    "cleanup_partial_upload",
+                    self.channel_entity,
+                    message_ids=message_ids
+                )
+                print(f"Cleaned up {len(uploaded_messages)} partial uploads")
+        except Exception as e:
+            print(f"Warning: Failed to clean up partial uploads: {e}")
 
     def get_cached_file(self, fh):
         if fh in self.cached_files:
@@ -153,7 +230,17 @@ class TelegramFileClient():
         
         print(f"Downloading file {fh} from Telegram ({len(msgIds)} parts)")
         
-        msgs = self.get_messages(msgIds)
+        # Use retry wrapper for getting messages
+        try:
+            msgs = self._retry_operation(
+                self.get_messages,
+                f"get_messages_for_{fh}",
+                msgIds
+            )
+        except Exception as e:
+            print(f"Failed to get messages for file {fh}: {e}")
+            raise
+        
         buf = BytesIO()
         total_encrypted_size = 0
         downloaded_size = 0
@@ -182,7 +269,18 @@ class TelegramFileClient():
             else:
                 progress_cb = None
             
-            result = self.download_message(m, progress_callback=progress_cb)
+            # Use retry wrapper for download
+            try:
+                result = self._retry_operation(
+                    self.download_message,
+                    f"download_part_{i}",
+                    m, 
+                    progress_callback=progress_cb
+                )
+            except Exception as e:
+                print(f"Failed to download part {i+1}/{len(msgs)} for file {fh}: {e}")
+                raise
+            
             buf.write(result)
             downloaded_size += len(result)
         
@@ -193,8 +291,12 @@ class TelegramFileClient():
 
         if self.encryption_key is not None:
             print(f"Decrypting {fh}")
-            f = Fernet(bytes(self.encryption_key, 'utf-8'))
-            readBytes = f.decrypt(readBytes)
+            try:
+                f = Fernet(bytes(self.encryption_key, 'utf-8'))
+                readBytes = f.decrypt(readBytes)
+            except Exception as e:
+                print(f"Failed to decrypt file {fh}: {e}")
+                raise
 
         barr = bytearray(readBytes)
         
@@ -209,8 +311,7 @@ class TelegramFileClient():
         return barr
 
     def get_messages(self, ids):
-        result = self.client.get_messages(self.channel_entity, ids=ids)
-        return result
+        return self.client.get_messages(self.channel_entity, ids=ids)
 
     def download_message(self, msg, progress_callback=None):
         return msg.download_media(bytes, progress_callback=progress_callback)
@@ -218,5 +319,14 @@ class TelegramFileClient():
     def delete_messages(self, ids):
         if ids:
             print(f"Deleting {len(ids)} messages from Telegram")
-            return self.client.delete_messages(self.channel_entity, message_ids=ids)
+            try:
+                return self._retry_operation(
+                    self.client.delete_messages,
+                    "delete_messages",
+                    self.channel_entity,
+                    message_ids=ids
+                )
+            except Exception as e:
+                print(f"Failed to delete messages: {e}")
+                raise
         return None
