@@ -1,8 +1,7 @@
 import logging
 logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.DEBUG)
 from telethon import TelegramClient, events, sync, utils
-from telethon.errors import FloodWaitError
-from telethon import errors
+from telethon.errors import FloodWaitError, RPCError, ServerError
 from dotenv import load_dotenv
 import os
 from io import BytesIO
@@ -52,15 +51,15 @@ class TelegramFileClient():
             print(f"Waiting {wait_time} seconds before retrying...")
             time.sleep(wait_time + 1)  # Add 1 second buffer
             return True  # Retry
-        elif isinstance(error, (RpcTimeoutError, ServerError)):
+        elif isinstance(error, (ServerError)):
             # Network or server errors - retry with exponential backoff
             delay = RETRY_DELAY * (2 ** (attempt - 1))
             print(f"Telegram {error.__class__.__name__} for {operation_name} (attempt {attempt}): Retrying in {delay} seconds...")
             time.sleep(delay)
             return True  # Retry
-        elif isinstance(error, RpcError):
+        elif isinstance(error, RPCError):
             # Other RPC errors - log and don't retry
-            print(f"Telegram RpcError for {operation_name}: {error}")
+            print(f"Telegram RPCError for {operation_name}: {error}")
             return False  # Don't retry
         else:
             # Unknown error
@@ -72,7 +71,7 @@ class TelegramFileClient():
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return operation(*args, **kwargs)
-            except (FloodWaitError, RpcError, RpcTimeoutError, ServerError) as e:
+            except (FloodWaitError, RPCError, ServerError) as e:
                 should_retry = self._handle_telegram_error(e, operation_name, attempt)
                 if not should_retry or attempt == MAX_RETRIES:
                     raise
