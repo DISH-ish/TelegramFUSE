@@ -1,7 +1,8 @@
 import logging
 logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.DEBUG)
 from telethon import TelegramClient, events, sync, utils
-from telethon.errors import FloodWaitError, RpcError, RpcTimeoutError, ServerError
+from telethon.errors import FloodWaitError, RpcTimeoutError, ServerError
+from telethon.errors.rpcerrorlist import RpcError
 from dotenv import load_dotenv
 import os
 from io import BytesIO
