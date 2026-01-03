@@ -4,4 +4,3 @@ cryptography
 cryptg
 pyfuse3
 cachetools
-tqdm
