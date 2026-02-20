@@ -4,3 +4,4 @@ cryptography
 cryptg
 pyfuse3
 cachetools
+textual>=0.47.0
