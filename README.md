@@ -5,7 +5,7 @@ Though Telegram allows file uploads, it is not intended to be used as cloud stor
 A [FUSE](https://en.wikipedia.org/wiki/Filesystem_in_Userspace) program that stores files on Telegram.
 
 Though I demonstrated Discord in the video too, I haven't included the code here. While I believe that storing your OWN files on Discord does NOT violate TOS, I think that spreading the code to do so might. Idk I'm trying to not actually get banned :)
-Watch devdetour's video, it's cool. But i've rewritten a ton of stuff so it isn't really relevant
+- Watch devdetour's video, it's cool. But i've rewritten a ton of stuff so it isn't really relevant
 
 ## Usage and How to Run
 ### Requirements
