@@ -28,10 +28,10 @@ Before running this, I recommend creating a virtual environment in Python.
 
 - TUI                        | It looks cool
     - python monitor.py      | Opens the TUI without starting the program, if you need the stats from the database
-- 4MB blocks                 | This should make it a lot less ram intensive
+- Configurable blocks        | Basically the new chunk size limit
 - Configurable cache         | Only size but that's better than nothing
 - Stronger encryption        | For all your privacy needs
-- Anonymized data block names| Still for privacy, it's so secure you can store your data in a group of other people storing data and they won't know what it is (that's completely pointless but fun)
+    - Anonymized data block names| Still for privacy, it's so secure you can store your data in a group of other people storing data and they won't know what it is (that's completely pointless but fun)
 - --repair and --repair-only | Did you database get corrupted or deleted somehow? you can now recover it, --repair fixes the database and starts the program
 - --sweep                    | Remove orphans
 - --check                    | Check the database for errors
