@@ -44,7 +44,6 @@ Before running this, I recommend creating a virtual environment in Python.
 - CHANNEL_LINK=              the link to your Telegram channel (https://t.me/foo)
 - ENCRYPTION_KEY=            64-char hex string, gets automatically generated if you choose so also you can put your own to decrypt the data
 - SESSION_NAME=              this can be whatever you want, just the name that will be used for the file storing details of your Telegram session
-- LOCAL_ADDR=                optional,default: default interface, you can set the ip of an interface you want to use, doesn't support ipv6 i think
 - CACHE_MAX_BLOCKS=          optional,default: 1280=5 GiB worth of 4 MB blocks
 - MAX_CONCURRENT_UPLOADS=    optional,default: 4
 - MAX_CONCURRENT_DOWNLOADS=  optional,default: 4
