@@ -1,3 +1,4 @@
+# ver 1.0
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +9,8 @@ from io import BytesIO
 from telethon import TelegramClient
 from dotenv import load_dotenv
 import os
+
+from stats import STATS
 
 log = logging.getLogger(__name__)
 load_dotenv()
@@ -45,6 +48,8 @@ def _progress_cb(sent: int, total: int) -> None:
     pct = int(sent / total * 100) if total else 0
     if pct % 10 == 0:
         log.debug("Upload progress: %d%%", pct)
+    if STATS.upload_active:
+        STATS.upload_block_progress(sent, total)
 
 
 class TelegramFileClient:
@@ -120,6 +125,29 @@ class TelegramFileClient:
                 if m is None or m.media is None:
                     missing.append(msg_id)
         return missing
+
+    def start_connectivity_monitor(self) -> "ConnectivityMonitor":
+        """
+        Start a background ConnectivityMonitor that pings PING_HOST:PING_PORT
+        and calls client.connect() when the network comes back up.
+        Returns the monitor so the caller can stop() it on shutdown.
+        """
+        from connectivity import ConnectivityMonitor
+        loop   = _get_tg_loop()
+        client = self._tg
+
+        def _reconnect() -> None:
+            log.info("Triggering Telethon reconnect after network recovery")
+            try:
+                future = asyncio.run_coroutine_threadsafe(client.connect(), loop)
+                future.result(timeout=30)
+                STATS.log("SUCCESS", "NET_RECONNECT", "Telegram session re-established")
+                log.info("Telethon reconnect OK")
+            except Exception as exc:
+                STATS.log("ERROR", "NET_RECONNECT_FAIL", str(exc))
+                log.error("Telethon reconnect failed: %s", exc)
+
+        return ConnectivityMonitor(on_reconnect=_reconnect).start()
 
     def iter_all_messages_raw(self, batch_size=100, progress_cb=None):
         """Yield (msg_id, raw_bytes) for every media message in the channel."""

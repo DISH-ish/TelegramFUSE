@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
+# ver 1.0
 from __future__ import annotations
-
 import sqlite3
 from datetime import datetime
 from time import time
-
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Label, RichLog, Static
-
 from stats import STATS
 
 
@@ -62,7 +60,6 @@ def _read_db_stats() -> dict:
         pending = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM file_meta")
         manifests = cur.fetchone()[0]
-        # Count how many blocks have a stored SHA-256 hash (v3+ manifests/flushes).
         try:
             cur.execute("SELECT COUNT(*) FROM blocks WHERE sha256 IS NOT NULL")
             hashed_blocks = cur.fetchone()[0]
@@ -242,16 +239,16 @@ class HandlesPanel(Static):
         self.update("\n".join(lines))
 
 
-class BackupPanel(Static):
-    DEFAULT_CSS = "BackupPanel { border: round $accent; padding: 0 1; height: 7; display: none; }"
+class UploadPanel(Static):
+    DEFAULT_CSS = "UploadPanel { border: round $accent; padding: 0 1; height: 7; display: none; }"
 
     def on_mount(self) -> None:
         self.set_interval(0.5, self._refresh)
 
     def _refresh(self) -> None:
-        b = STATS.snapshot()["backup"]
+        b = STATS.snapshot()["direct_upload"]
         if b["finished"]:
-            # Backup completed (naturally or via stop) — close the TUI.
+            # Direct upload completed (naturally or via stop) — close the TUI.
             self.app.exit()
             return
         if not b["active"]:
@@ -265,7 +262,7 @@ class BackupPanel(Static):
         fd  = b["files_done"]
         fs  = b["files_skipped"]
         fe  = b["files_errors"]
-        bw  = max(4, self.size.width - 12)
+        bw  = max(4, self.size.width - 25)
 
         pct_bytes = bd / bt if bt else 0.0
         pct_files = (fd + fs) / ft if ft else 0.0
@@ -274,19 +271,16 @@ class BackupPanel(Static):
         cnbl = b["current_nblocks"]
 
         cur_display = ("…" + cur[-(bw - 2):]) if len(cur) > bw else cur
-
-        blk_str = (f"  block {cblk + 1}/{cnbl}"
-                   if cnbl else "")
+        blk_str = (f"  block {cblk + 1}/{cnbl}" if cnbl else "")
 
         lines = [
-            f"[bold cyan]  BACKUP[/]"
-            f"  [dim]files {fd + fs}/{ft}[/]"
-            f"  [yellow]err {fe}[/]" if fe else
-            f"[bold cyan]  BACKUP[/]  [dim]files {fd + fs}/{ft}[/]",
-            f"  files  [{_pct_bar(pct_files, bw)}] {pct_files * 100:.0f}%",
-            f"  bytes  [{_pct_bar(pct_bytes, bw)}] "
-            f"{_fmt_bytes(bd)} / {_fmt_bytes(bt)}",
-            f"  [dim]{cur_display}[/][cyan]{blk_str}[/]" if cur_display else "  [dim]scanning…[/]",
+            f"[bold cyan] DIRECT UPLOAD[/]"
+            f" [dim]files {fd + fs}/{ft}[/]"
+            f" [yellow]err {fe}[/]" if fe else
+            f"[bold cyan] DIRECT UPLOAD[/]  [dim]files {fd + fs}/{ft} | {_fmt_bytes(bd)} / {_fmt_bytes(bt)}[/]",
+            f" files  [{_pct_bar(pct_files, bw)}] ",
+            f" bytes  [{_pct_bar(pct_bytes, bw)}] ",
+            f" [dim]{cur_display}[/][cyan]{blk_str}[/]" if cur_display else "  [dim]scanning…[/]",
         ]
         self.update("\n".join(lines))
 
@@ -341,7 +335,7 @@ class StatusBar(Static):
         if ad:
             parts.append(f"↓{ad}")
         if av:
-            parts.append(f"✓{av}")
+            parts.append(f"p{av}")
         if parts:
             self._tick = (self._tick + 1) % len(_SPINNER)
             spinner = f" [yellow]{_SPINNER[self._tick]} {' '.join(parts)}[/]"
@@ -353,9 +347,40 @@ class StatusBar(Static):
             alerts.append(f"{dl} DL hash fail(s)")
         health = f"  [bold red]{'  '.join(alerts)}[/]" if alerts else ""
 
+        net    = snap["network"]
+        if net["online"]:
+            net_seg = " [green]●[/]"
+        else:
+            offline_s = STATS.network_offline_seconds()
+            net_seg = f" [red blink]●[/] [red]offline {_fmt_uptime(offline_s)}[/]"
+
+        upload_seg = ""
+        du = snap["direct_upload"]
+        if du["active"]:
+            ft  = du["files_total"]
+            fd  = du["files_done"] + du["files_skipped"]
+            bs  = du["current_block_bytes_done"]
+            bt_ = du["current_block_bytes_total"]
+            cn  = du["current_nblocks"]
+            bw_blk = 10
+            if bt_ > 0:
+                pct_blk = bs / bt_
+                blk_bar = _pct_bar(pct_blk, bw_blk)
+                blk_detail = f"{_fmt_bytes(bs)}/{_fmt_bytes(bt_)}"
+            elif cn:
+                blk_bar = _pct_bar(0.0, bw_blk)
+                blk_detail = f"0/{cn} blks"
+            else:
+                blk_bar = "waiting…"
+                blk_detail = ""
+            upload_seg = (
+                f"  [bold cyan]DU[/] [dim]file {fd}/{ft}[/]"
+                f"  blk [{blk_bar}] {blk_detail}"
+            )
+
         self.update(
-            f" [bold cyan]/\ TelegramFS Monitor[/]"
-            f"  uptime [green]{_fmt_uptime(snap['uptime'])}[/]{spinner}{health}"
+            f" [bold cyan]/\\ TelegramFS Monitor[/]"
+            f"  uptime [green]{_fmt_uptime(snap['uptime'])}[/]{spinner}{net_seg}{upload_seg}{health}"
         )
 
 
@@ -382,11 +407,19 @@ class TelegramFsMonitor(App):
             yield VerifyPanel()
             yield OpsPanel()
         yield DbPanel()
-        yield BackupPanel()
+        yield UploadPanel()
         yield HandlesPanel()
         yield Label(" ACTIVITY LOG", id="log-label")
         yield ActivityLog(highlight=True, markup=True, wrap=False)
         yield Footer()
+
+    def on_unmount(self) -> None:
+        """Ensure terminal is always restored on any exit path."""
+        import sys
+        # Restore cursor and exit alternate screen explicitly.
+        # Textual normally does this, but redundant calls are harmless.
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
 
     def action_quit(self) -> None:
         if self._shutdown_callback is not None:
@@ -397,7 +430,9 @@ class TelegramFsMonitor(App):
     def action_force_quit(self) -> None:
         import os, signal
         STATS.log("WARNING", "FORCE_QUIT", "killed by user")
-        os.kill(os.getpid(), signal.SIGKILL)
+        # SIGTERM (not SIGKILL) lets Textual restore the terminal
+        # (cursor + alternate screen) before the process exits.
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def action_clear_log(self) -> None:
         log_widget = self.query_one(ActivityLog)

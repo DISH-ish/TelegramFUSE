@@ -1,3 +1,4 @@
+# ver 1.0
 import os
 import sqlite3
 import sys
@@ -36,24 +37,24 @@ def _parse_top_level() -> tuple[bool, bool, bool, bool, str | None, str]:
     do_check    = "--check" in argv
     do_sweep    = "--sweep" in argv
 
-    backup_src  = None
-    backup_dest = "/"
-    if "--backup" in argv:
-        idx = argv.index("--backup")
+    upload_src  = None
+    upload_dest = "/"
+    if "--upload" in argv:
+        idx = argv.index("--upload")
         if idx + 1 < len(argv):
-            backup_src = argv[idx + 1]
+            upload_src = argv[idx + 1]
         else:
-            print("  ✗  --backup requires a source path argument.")
+            print("  ✗  --upload requires a source path argument.")
             sys.exit(1)
-    if "--backup-dest" in argv:
-        idx = argv.index("--backup-dest")
+    if "--upload-dest" in argv:
+        idx = argv.index("--upload-dest")
         if idx + 1 < len(argv):
-            backup_dest = argv[idx + 1]
+            upload_dest = argv[idx + 1]
         else:
-            print("  ✗  --backup-dest requires a destination path argument.")
+            print("  ✗  --upload-dest requires a destination path argument.")
             sys.exit(1)
 
-    return do_repair, repair_only, do_check, do_sweep, backup_src, backup_dest
+    return do_repair, repair_only, do_check, do_sweep, upload_src, upload_dest
 
 
 def _setup_cipher(enc_key_hex: str) -> BlockCipher | None:
@@ -104,7 +105,7 @@ def _db_is_corrupt(db_path: str) -> bool:
 
 def init() -> None:
     load_dotenv()
-    do_repair, repair_only, do_check, do_sweep, backup_src, backup_dest = _parse_top_level()
+    do_repair, repair_only, do_check, do_sweep, upload_src, upload_dest = _parse_top_level()
 
     if not _validate_env():
         sys.exit(1)
@@ -115,7 +116,9 @@ def init() -> None:
         os.getenv("SESSION_NAME"), os.getenv("APP_ID"),
         os.getenv("APP_HASH"), os.getenv("CHANNEL_LINK"),
     )
-    block_store  = BlockStore(tg_client, cipher)
+    block_store    = BlockStore(tg_client, cipher)
+    _conn_monitor  = tg_client.start_connectivity_monitor()
+    block_store.set_gate(_conn_monitor)
 
     print(f"Encryption : {'AES-256-GCM' if cipher else 'OFF'}")
     print(f"Block size : 4 MiB")
@@ -142,14 +145,15 @@ def init() -> None:
             sys.exit(0)
         print("  Proceeding to mount …\n")
 
-    if backup_src is not None:
+    if upload_src is not None:
+        import sqlite3
         import threading
         import trio
-        from backup import run_backup
-        if not os.path.isdir(backup_src):
-            print(f"  ✗  Backup source does not exist or is not a directory: {backup_src!r}")
+        from upload import run_upload
+        if not os.path.isdir(upload_src):
+            print(f"  ✗  Upload source does not exist or is not a directory: {upload_src!r}")
             sys.exit(1)
-        print(f"\n  Backing up {backup_src!r} → TelegramFS:{backup_dest!r}")
+        print(f"\n  Uploading {upload_src!r} → TelegramFS:{upload_dest!r}")
         print("  (DB must not be in use by a mounted filesystem)\n")
         db = sqlite3.connect("telegram.db", check_same_thread=False)
         db.text_factory = str
@@ -159,35 +163,35 @@ def init() -> None:
 
         no_monitor = "--no-monitor" in sys.argv
 
-        async def _run_backup_with_deleter():
+        async def _run_upload_with_deleter():
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(block_store.deleter.run_background)
-                # done_callback=None: BackupPanel polls STATS.backup_finished
+                # done_callback=None: UploadPanel polls STATS.upload_finished
                 # and calls app.exit() from within the Textual event loop.
-                await run_backup(backup_src, backup_dest, block_store, db)
+                await run_upload(upload_src, upload_dest, block_store, db)
                 nursery.cancel_scope.cancel()
 
         if no_monitor:
-            trio.run(_run_backup_with_deleter)
+            trio.run(_run_upload_with_deleter)
             db.close()
         else:
-            def backup_shutdown(app):  # noqa: ARG001
+            def upload_shutdown(app):  # noqa: ARG001
                 """Q pressed: stop after current file, do not exit immediately.
-                BackupPanel polls STATS.backup_finished and exits the app once done."""
-                STATS.backup_stop_requested = True
-                STATS.log("WARNING", "BACKUP_STOP_REQ",
+                UploadPanel polls STATS.upload_finished and exits the app once done."""
+                STATS.upload_stop_requested = True
+                STATS.log("WARNING", "DU_STOP_REQ",
                           "finishing current file then stopping …")
 
             backup_thread = threading.Thread(
-                target=lambda: trio.run(_run_backup_with_deleter),
-                name="backup-worker",
+                target=lambda: trio.run(_run_upload_with_deleter),
+                name="upload-worker",
                 daemon=False,  # never kill mid-upload
             )
             backup_thread.start()
             from monitor import launch_monitor_blocking
-            # Q → backup_shutdown sets stop flag; BackupPanel exits app when done.
-            # Natural finish → BackupPanel polls backup_finished, exits app.
-            launch_monitor_blocking(shutdown_callback=backup_shutdown)
+            # Q → upload_shutdown sets stop flag; UploadPanel exits app when done.
+            # Natural finish → UploadPanel polls upload_finished, exits app.
+            launch_monitor_blocking(shutdown_callback=upload_shutdown)
             backup_thread.join()
             db.close()
         return

@@ -1,5 +1,5 @@
+# ver 1.0
 from __future__ import annotations
-
 import os
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 

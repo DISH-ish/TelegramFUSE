@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ver 1.1
 from __future__ import annotations
 
 import atexit
@@ -20,6 +21,7 @@ from pyfuse3 import FUSEError
 from block_store import BlockStore, BLOCK_SIZE, blocks_for_range, sha256_hex
 from stats import STATS
 from verify import verify_and_fix_blocks
+from schema import ensure_schema
 
 try:
     import faulthandler
@@ -54,70 +56,8 @@ class Operations(pyfuse3.Operations):
         # { inode: {"size": int, "msg_id_map": dict[int, int]} }
         self._inode_cache: dict[int, dict] = {}
 
-        self._init_schema()
+        ensure_schema(self.db)
         self._cleanup_pending_uploads()
-
-    def _init_schema(self) -> None:
-        self.cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='inodes'"
-        )
-        if self.cursor.fetchone() is not None:
-            self._migrate_schema()
-            return
-
-        self.cursor.execute("""
-            CREATE TABLE inodes (
-                id INTEGER PRIMARY KEY, uid INT NOT NULL, gid INT NOT NULL,
-                mode INT NOT NULL, mtime_ns INT NOT NULL, atime_ns INT NOT NULL,
-                ctime_ns INT NOT NULL, target BLOB(256),
-                size INT NOT NULL DEFAULT 0, rdev INT NOT NULL DEFAULT 0
-            )
-        """)
-        self.cursor.execute("""
-            CREATE TABLE blocks (
-                inode INT NOT NULL REFERENCES inodes(id),
-                block_idx INT NOT NULL, msg_id INT NOT NULL,
-                sha256 TEXT,
-                PRIMARY KEY (inode, block_idx)
-            )
-        """)
-        self.cursor.execute("CREATE INDEX idx_blocks_inode ON blocks(inode)")
-        self.cursor.execute("""
-            CREATE TABLE file_meta (
-                inode INT NOT NULL PRIMARY KEY REFERENCES inodes(id),
-                meta_msg_id INT NOT NULL
-            )
-        """)
-        # Crash recovery: records in-flight uploads so they can be cleaned on restart.
-        self.cursor.execute("""
-            CREATE TABLE pending_blocks (
-                msg_id INT PRIMARY KEY, inode INT NOT NULL,
-                block_idx INT NOT NULL, started_at REAL NOT NULL
-            )
-        """)
-        self.cursor.execute("""
-            CREATE TABLE contents (
-                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-                name BLOB(256) NOT NULL, inode INT NOT NULL REFERENCES inodes(id),
-                parent_inode INT NOT NULL REFERENCES inodes(id),
-                UNIQUE (name, parent_inode)
-            )
-        """)
-
-        now_ns = int(time() * 1e9)
-        mode   = (stat.S_IFDIR
-                  | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-                  | stat.S_IRGRP | stat.S_IXGRP
-                  | stat.S_IROTH | stat.S_IXOTH)
-        self.cursor.execute(
-            "INSERT INTO inodes (id,mode,uid,gid,mtime_ns,atime_ns,ctime_ns) VALUES (?,?,?,?,?,?,?)",
-            (pyfuse3.ROOT_INODE, mode, os.getuid(), os.getgid(), now_ns, now_ns, now_ns),
-        )
-        self.cursor.execute(
-            "INSERT INTO contents (name, parent_inode, inode) VALUES (?,?,?)",
-            (b"..", pyfuse3.ROOT_INODE, pyfuse3.ROOT_INODE),
-        )
-        self.db.commit()
 
     def _cleanup_pending_uploads(self) -> None:
         """
@@ -177,43 +117,6 @@ class Operations(pyfuse3.Operations):
         self.db.commit()
         log.info("Pending-block cleanup done: %d restored, %d orphan(s) removed",
                  restored, len(orphan_ids))
-
-    def _migrate_schema(self) -> None:
-        changed = False
-        self.cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_meta'"
-        )
-        if self.cursor.fetchone() is None:
-            self.cursor.execute("""
-                CREATE TABLE file_meta (
-                    inode INT NOT NULL PRIMARY KEY REFERENCES inodes(id),
-                    meta_msg_id INT NOT NULL
-                )
-            """)
-            changed = True
-
-        self.cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_blocks'"
-        )
-        if self.cursor.fetchone() is None:
-            self.cursor.execute("""
-                CREATE TABLE pending_blocks (
-                    msg_id INT PRIMARY KEY, inode INT NOT NULL,
-                    block_idx INT NOT NULL, started_at REAL NOT NULL
-                )
-            """)
-            changed = True
-
-        # Add sha256 column to blocks if it does not exist yet (migration from pre-v3).
-        self.cursor.execute("PRAGMA table_info(blocks)")
-        cols = {row[1] for row in self.cursor.fetchall()}
-        if "sha256" not in cols:
-            log.info("Migrating blocks table: adding sha256 column")
-            self.cursor.execute("ALTER TABLE blocks ADD COLUMN sha256 TEXT")
-            changed = True
-
-        if changed:
-            self.db.commit()
 
     def _one(self, sql: str, params: tuple = ()) -> sqlite3.Row:
         self.cursor.execute(sql, params)
@@ -880,51 +783,81 @@ class Operations(pyfuse3.Operations):
                   + (f"  ({len(remaining)} new-dirty remain)" if remaining else ""))
         self._flushing_fhs.discard(fh)
 
-    async def _writeback_pressure_loop(self) -> None:
-        """Background task: flush the dirtiest open file handle when total
-        in-memory dirty data exceeds MAX_DIRTY_BYTES.
+    async def _flush_fh_guarded(self, fh: int) -> None:
+        """Flush fh and always remove it from _flushing_fhs when done."""
+        try:
+            await self._flush_fh(fh)
+        except FUSEError as exc:
+            log.warning("pressure flush failed fh=%d: %s", fh, exc)
+        except Exception as exc:
+            log.error("pressure flush unexpected error fh=%d: %s", fh, exc, exc_info=True)
+        finally:
+            self._flushing_fhs.discard(fh)
 
-        Runs in the same trio thread as pyfuse3.main so it can safely call
-        _flush_fh without any locking.  Only one flush per fh runs at a time
-        (enforced by _flushing_fhs).
+    async def _writeback_pressure_loop(self) -> None:
+        """Background task: flush dirty file handles when total in-memory dirty
+        data exceeds MAX_DIRTY_BYTES.  Multiple handles are flushed concurrently;
+        the shared BlockStore._ul_limiter caps total concurrent block uploads.
+
+        Runs in the same trio thread as pyfuse3.main — no locking needed.
+        Only one flush per fh runs at a time (enforced by _flushing_fhs).
         """
         log.debug("writeback pressure loop started  threshold=%d MiB",
                   MAX_DIRTY_BYTES // 1024 ** 2)
-        while True:
-            await trio.sleep(0.5)
-            fh_sizes = {
-                fh: sum(len(b) for b in blocks.values())
-                for fh, blocks in self._dirty_blocks.items()
-            }
-            total = sum(fh_sizes.values())
-            if total < MAX_DIRTY_BYTES:
-                continue
+        async with trio.open_nursery() as nursery:
+            while True:
+                await trio.sleep(0.5)
+                fh_sizes = {
+                    fh: sum(len(b) for b in blocks.values())
+                    for fh, blocks in self._dirty_blocks.items()
+                }
+                total = sum(fh_sizes.values())
+                if total < MAX_DIRTY_BYTES:
+                    continue
 
-            # Pick the fh with the most dirty data that isn't already flushing.
-            candidates = [
-                (sz, fh) for fh, sz in fh_sizes.items()
-                if fh not in self._flushing_fhs and sz > 0
-            ]
-            if not candidates:
-                continue
+                # Launch a flush task for every dirty fh not already flushing.
+                # The shared _ul_limiter in BlockStore caps how many blocks are
+                # actually in-flight across all these concurrent flushes.
+                candidates = [
+                    (sz, fh) for fh, sz in fh_sizes.items()
+                    if fh not in self._flushing_fhs and sz > 0
+                ]
+                if not candidates:
+                    continue
 
-            _, fh = max(candidates)
-            STATS.log(
-                "INFO", "WRITEBACK_PRESSURE",
-                f"total dirty={total // 1024**2} MiB >= threshold="
-                f"{MAX_DIRTY_BYTES // 1024**2} MiB — flushing fh={fh} "
-                f"({fh_sizes[fh] // 1024**2} MiB dirty)",
-            )
-            try:
-                await self._flush_fh(fh)
-            except FUSEError as exc:
-                log.warning("writeback pressure flush failed fh=%d: %s", fh, exc)
-            except Exception as exc:
-                log.error("writeback pressure flush unexpected error fh=%d: %s",
-                          fh, exc, exc_info=True)
-            finally:
-                # Always unmark so a failed flush can be retried next cycle.
-                self._flushing_fhs.discard(fh)
+                STATS.log(
+                    "INFO", "WRITEBACK_PRESSURE",
+                    f"total dirty={total // 1024**2} MiB >= threshold="
+                    f"{MAX_DIRTY_BYTES // 1024**2} MiB — "
+                    f"launching {len(candidates)} flush task(s)",
+                )
+                for _, fh in sorted(candidates, reverse=True):
+                    self._flushing_fhs.add(fh)
+                    nursery.start_soon(self._flush_fh_guarded, fh)
+
+    async def _drain_dirty_blocks(self) -> None:
+        """Flush all remaining dirty blocks to Telegram after unmount,
+        concurrently. Called once pyfuse3.main() has returned (kernel detached)
+        so no new writes can arrive."""
+        fh_list = [fh for fh, blocks in self._dirty_blocks.items() if blocks]
+        if not fh_list:
+            return
+        total = sum(
+            sum(len(b) for b in self._dirty_blocks[fh].values())
+            for fh in fh_list
+        )
+        STATS.log(
+            "WARNING", "SHUTDOWN_DRAIN",
+            f"flushing {len(fh_list)} dirty handle(s)  "
+            f"({total // 1024**2} MiB) before exit …",
+        )
+        async with trio.open_nursery() as nursery:
+            for fh in fh_list:
+                if fh in self._flushing_fhs:
+                    continue  # already in progress — will finish naturally
+                self._flushing_fhs.add(fh)
+                nursery.start_soon(self._flush_fh_guarded, fh)
+        STATS.log("INFO", "SHUTDOWN_DRAIN", "drain complete")
 
     def _delete_blocks_sync(self, inode: int) -> None:
         """
@@ -1016,6 +949,36 @@ def runFs(block_store: BlockStore) -> None:
             nursery.start_soon(pyfuse3.main)
             nursery.start_soon(block_store.deleter.run_background)
             nursery.start_soon(operations._writeback_pressure_loop)
+            # pyfuse3.main() exits when the filesystem is unmounted.
+            # That cancels the nursery scope, which sends Cancelled to the
+            # other tasks.  If any task is blocked inside a Telegram awaitable
+            # with no nearby checkpoint the cancel may take a while, so we
+            # give the nursery a hard 8-second deadline from the moment
+            # pyfuse3.main() returns.
+            #
+            # We can't set the deadline here (before the tasks start), so
+            # instead we wrap pyfuse3.main in a helper that arms a cancel
+            # scope on the outer nursery once it finishes.
+            pass  # (structure comment only — deadline set via wrapper below)
+
+    async def _run_with_deleter():  # noqa: F811 (intentional re-definition)
+        # Wrapper that arms a hard deadline once pyfuse3.main exits.
+        TEARDOWN_GRACE = 8  # seconds
+
+        async def _pyfuse3_main_then_deadline():
+            await pyfuse3.main()
+            # pyfuse3.main() returned → kernel has detached.  No new writes
+            # can arrive, but dirty blocks in RAM haven't been uploaded yet.
+            # Flush them now before allowing teardown.
+            await operations._drain_dirty_blocks()
+            # Give the deleter and other nursery tasks TEARDOWN_GRACE seconds
+            # to finish, then hard-cancel them.
+            nursery.cancel_scope.deadline = trio.current_time() + TEARDOWN_GRACE
+
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(_pyfuse3_main_then_deadline)
+            nursery.start_soon(block_store.deleter.run_background)
+            nursery.start_soon(operations._writeback_pressure_loop)
 
     if not options.no_monitor:
         fuse_thread = threading.Thread(
@@ -1027,15 +990,63 @@ def runFs(block_store: BlockStore) -> None:
         from monitor import launch_monitor_blocking
 
         def fuse_shutdown(app):
+            import os, signal, threading
             STATS.log("WARNING", "SHUTDOWN", "Unmounting filesystem …")
-            try:
-                pyfuse3.close(unmount=True)
-            except Exception:
-                pass
-            app.exit()
+
+            def _do_unmount():
+                # Step 1: ask pyfuse3 to unmount.  This should cause pyfuse3.main()
+                # to return, which lets trio cancel the nursery (deleter, pressure
+                # loop), and the fuse_thread exits.  BUT pyfuse3.close() can itself
+                # block if the kernel has in-flight FUSE requests, so we run it in
+                # yet another thread with its own timeout.
+                close_done = threading.Event()
+
+                def _close():
+                    try:
+                        pyfuse3.close(unmount=True)
+                    except Exception:
+                        pass
+                    finally:
+                        close_done.set()
+
+                threading.Thread(target=_close, daemon=True, name="pyfuse3-close").start()
+
+                # Wait up to 3 s for the close to finish, then proceed regardless.
+                close_done.wait(timeout=3)
+                if not close_done.is_set():
+                    STATS.log("WARNING", "SHUTDOWN",
+                              "pyfuse3.close() blocked >3 s — forcing unmount via fusermount")
+                    try:
+                        import subprocess, shutil
+                        mnt = getattr(options, "mountpoint", None)
+                        if mnt and shutil.which("fusermount3"):
+                            subprocess.run(["fusermount3", "-uz", str(mnt)],
+                                           timeout=3, check=False)
+                        elif mnt and shutil.which("fusermount"):
+                            subprocess.run(["fusermount", "-uz", str(mnt)],
+                                           timeout=3, check=False)
+                    except Exception:
+                        pass
+
+                # Step 2: wait up to 5 s for the fuse_thread to finish cleanly.
+                fuse_thread.join(timeout=5)
+
+                if fuse_thread.is_alive():
+                    STATS.log("WARNING", "SHUTDOWN",
+                              "fuse thread still alive — SIGTERM")
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    fuse_thread.join(timeout=3)
+
+                if fuse_thread.is_alive():
+                    STATS.log("WARNING", "SHUTDOWN", "still alive — SIGKILL")
+                    os.kill(os.getpid(), signal.SIGKILL)
+
+                # Step 3: exit the TUI (runs on Textual's main thread).
+                app.call_from_thread(app.exit)
+
+            threading.Thread(target=_do_unmount, daemon=True, name="shutdown").start()
 
         launch_monitor_blocking(shutdown_callback=fuse_shutdown)
-        # pyfuse3.close() caused pyfuse3.main() to return so join() is quick.
         fuse_thread.join()
     else:
         trio.run(_run_with_deleter)

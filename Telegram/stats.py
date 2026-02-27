@@ -1,3 +1,4 @@
+# ver 1.0
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -66,23 +67,29 @@ class FsStats:
         self.encryption_enabled: bool = False
         self.mountpoint:         str  = ""
 
+        # ── network connectivity ───────────────────────────────────────────
+        self.network_online:         bool            = True   # optimistic until first probe
+        self._network_went_offline:  Optional[float] = None   # monotonic timestamp
+
         self._handles: dict[int, HandleInfo] = {}
         self._log: deque[LogEntry] = deque(maxlen=MAX_LOG_ENTRIES)
 
-        # ── backup progress ────────────────────────────────────────────────
-        self.backup_active:           bool  = False
-        self.backup_stop_requested:   bool  = False
-        self.backup_finished:          bool  = False
-        self.backup_files_total:   int   = 0
-        self.backup_files_done:    int   = 0
-        self.backup_files_skipped: int   = 0
-        self.backup_files_errors:  int   = 0
-        self.backup_bytes_total:   int   = 0
-        self.backup_bytes_done:    int   = 0
-        self.backup_current_file:  str   = ""
-        self.backup_current_size:  int   = 0
-        self.backup_current_block: int   = 0
-        self.backup_current_nblocks: int = 0
+        # ── direct upload progress ────────────────────────────────────────────────
+        self.upload_active:           bool  = False
+        self.upload_stop_requested:   bool  = False
+        self.upload_finished:          bool  = False
+        self.upload_files_total:   int   = 0
+        self.upload_files_done:    int   = 0
+        self.upload_files_skipped: int   = 0
+        self.upload_files_errors:  int   = 0
+        self.upload_bytes_total:   int   = 0
+        self.upload_bytes_done:    int   = 0
+        self.upload_current_file:  str   = ""
+        self.upload_current_size:  int   = 0
+        self.upload_current_block: int   = 0
+        self.upload_current_nblocks: int = 0
+        self.upload_current_block_bytes_done:  int = 0
+        self.upload_current_block_bytes_total: int = 0
 
     # ── cache ──────────────────────────────────────────────────────────────
 
@@ -223,52 +230,79 @@ class FsStats:
         with self._lock:
             self._log.append(LogEntry(time(), level, operation, detail))
 
-    # ── backup progress ───────────────────────────────────────────────────
+    # ── direct upload progress ───────────────────────────────────────────────────
 
-    def backup_set_totals(self, n_files: int, n_bytes: int) -> None:
+    def upload_set_totals(self, n_files: int, n_bytes: int) -> None:
         with self._lock:
-            self.backup_active          = True
-            self.backup_stop_requested  = False
-            self.backup_finished        = False
-            self.backup_files_total     = n_files
-            self.backup_bytes_total     = n_bytes
+            self.upload_active          = True
+            self.upload_stop_requested  = False
+            self.upload_finished        = False
+            self.upload_files_total     = n_files
+            self.upload_bytes_total     = n_bytes
 
-    def backup_file_start(self, path: str, size: int) -> None:
+    def upload_file_start(self, path: str, size: int) -> None:
         with self._lock:
-            self.backup_current_file   = path
-            self.backup_current_size   = size
-            self.backup_current_block  = 0
-            self.backup_current_nblocks = 0
+            self.upload_current_file   = path
+            self.upload_current_size   = size
+            self.upload_current_block  = 0
+            self.upload_current_nblocks = 0
 
-    def backup_block_start(self, block_idx: int, n_blocks: int, path: str) -> None:
+    def upload_block_start(self, block_idx: int, n_blocks: int, path: str) -> None:
         with self._lock:
-            self.backup_current_block   = block_idx
-            self.backup_current_nblocks = n_blocks
+            self.upload_current_block              = block_idx
+            self.upload_current_nblocks            = n_blocks
+            self.upload_current_block_bytes_done   = 0
+            self.upload_current_block_bytes_total  = 0
 
-    def backup_block_done(self, n_bytes: int) -> None:
+    def upload_block_done(self, n_bytes: int) -> None:
         with self._lock:
-            self.backup_bytes_done += n_bytes
+            self.upload_bytes_done += n_bytes
 
-    def backup_file_done(self) -> None:
+    def upload_block_progress(self, sent: int, total: int) -> None:
+        """Update intra-block upload progress (called from Telegram progress callback)."""
         with self._lock:
-            self.backup_files_done    += 1
-            self.backup_current_file   = ""
+            self.upload_current_block_bytes_done  = sent
+            self.upload_current_block_bytes_total = total
 
-    def backup_file_skipped(self, size: int) -> None:
+    def upload_file_done(self) -> None:
         with self._lock:
-            self.backup_files_skipped += 1
-            self.backup_bytes_done    += size
+            self.upload_files_done    += 1
+            self.upload_current_file   = ""
 
-    def backup_file_error(self) -> None:
+    def upload_file_skipped(self, size: int) -> None:
         with self._lock:
-            self.backup_files_errors += 1
-            self.backup_current_file  = ""
+            self.upload_files_skipped += 1
+            self.upload_bytes_done    += size
 
-    def backup_finish(self) -> None:
+    def upload_file_error(self) -> None:
         with self._lock:
-            self.backup_active       = False
-            self.backup_finished     = True
-            self.backup_current_file = ""
+            self.upload_files_errors += 1
+            self.upload_current_file  = ""
+
+    def upload_finish(self) -> None:
+        with self._lock:
+            self.upload_active       = False
+            self.upload_finished     = True
+            self.upload_current_file = ""
+
+    # ── network ───────────────────────────────────────────────────────────
+
+    def set_network_state(self, online: bool) -> None:
+        import time as _time
+        with self._lock:
+            if online and not self.network_online:
+                self._network_went_offline = None
+            elif not online and self.network_online:
+                self._network_went_offline = _time.monotonic()
+            self.network_online = online
+
+    def network_offline_seconds(self) -> float:
+        """Seconds since the network went offline (0 if currently online)."""
+        import time as _time
+        with self._lock:
+            if self._network_went_offline is None:
+                return 0.0
+            return _time.monotonic() - self._network_went_offline
 
     # ── snapshot ───────────────────────────────────────────────────────────
 
@@ -279,6 +313,9 @@ class FsStats:
                 "uptime":     time() - self.started_at,
                 "mountpoint": self.mountpoint,
                 "encryption": self.encryption_enabled,
+                "network": {
+                    "online": self.network_online,
+                },
                 "cache": {
                     "hits":          self.cache_hits,
                     "misses":        self.cache_misses,
@@ -323,19 +360,21 @@ class FsStats:
                 },
                 "handles": list(self._handles.values()),
                 "log":     list(self._log),
-                "backup": {
-                    "active":               self.backup_active,
-                    "stop_requested":       self.backup_stop_requested,
-                    "finished":             self.backup_finished,
-                    "files_total":     self.backup_files_total,
-                    "files_done":      self.backup_files_done,
-                    "files_skipped":   self.backup_files_skipped,
-                    "files_errors":    self.backup_files_errors,
-                    "bytes_total":     self.backup_bytes_total,
-                    "bytes_done":      self.backup_bytes_done,
-                    "current_file":    self.backup_current_file,
-                    "current_block":   self.backup_current_block,
-                    "current_nblocks": self.backup_current_nblocks,
+                "direct_upload": {
+                    "active":               self.upload_active,
+                    "stop_requested":       self.upload_stop_requested,
+                    "finished":             self.upload_finished,
+                    "files_total":     self.upload_files_total,
+                    "files_done":      self.upload_files_done,
+                    "files_skipped":   self.upload_files_skipped,
+                    "files_errors":    self.upload_files_errors,
+                    "bytes_total":     self.upload_bytes_total,
+                    "bytes_done":      self.upload_bytes_done,
+                    "current_file":    self.upload_current_file,
+                    "current_block":   self.upload_current_block,
+                    "current_nblocks": self.upload_current_nblocks,
+                    "current_block_bytes_done":  self.upload_current_block_bytes_done,
+                    "current_block_bytes_total": self.upload_current_block_bytes_total,
                 },
             }
 

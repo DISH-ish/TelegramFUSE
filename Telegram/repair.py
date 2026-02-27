@@ -1,3 +1,4 @@
+# ver 1.1
 from __future__ import annotations
 
 import logging
@@ -8,63 +9,13 @@ import stat
 import sys
 from time import time
 
-import pyfuse3
+from schema import ROOT_INODE, init_schema
 
 from block_store import MANIFEST_MAGIC
 
 log     = logging.getLogger(__name__)
 DB_PATH = "telegram.db"
 
-
-def _create_schema(db: sqlite3.Connection) -> None:
-    db.executescript("""
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
-
-        CREATE TABLE inodes (
-            id INTEGER PRIMARY KEY, uid INT NOT NULL, gid INT NOT NULL,
-            mode INT NOT NULL, mtime_ns INT NOT NULL, atime_ns INT NOT NULL,
-            ctime_ns INT NOT NULL, target BLOB(256),
-            size INT NOT NULL DEFAULT 0, rdev INT NOT NULL DEFAULT 0
-        );
-        CREATE TABLE blocks (
-            inode INT NOT NULL REFERENCES inodes(id),
-            block_idx INT NOT NULL, msg_id INT NOT NULL,
-            sha256 TEXT,
-            PRIMARY KEY (inode, block_idx)
-        );
-        CREATE INDEX idx_blocks_inode ON blocks(inode);
-        CREATE TABLE file_meta (
-            inode INT NOT NULL PRIMARY KEY REFERENCES inodes(id),
-            meta_msg_id INT NOT NULL
-        );
-        CREATE TABLE pending_blocks (
-            msg_id INT PRIMARY KEY, inode INT NOT NULL,
-            block_idx INT NOT NULL, started_at REAL NOT NULL
-        );
-        CREATE TABLE contents (
-            rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-            name BLOB(256) NOT NULL, inode INT NOT NULL REFERENCES inodes(id),
-            parent_inode INT NOT NULL REFERENCES inodes(id),
-            UNIQUE (name, parent_inode)
-        );
-    """)
-
-
-def _insert_root(db: sqlite3.Connection) -> None:
-    now_ns = int(time() * 1e9)
-    mode   = (stat.S_IFDIR
-              | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-              | stat.S_IRGRP | stat.S_IXGRP
-              | stat.S_IROTH | stat.S_IXOTH)
-    db.execute(
-        "INSERT INTO inodes (id,mode,uid,gid,mtime_ns,atime_ns,ctime_ns) VALUES (?,?,?,?,?,?,?)",
-        (pyfuse3.ROOT_INODE, mode, os.getuid(), os.getgid(), now_ns, now_ns, now_ns),
-    )
-    db.execute(
-        "INSERT INTO contents (name, parent_inode, inode) VALUES (?,?,?)",
-        (b"..", pyfuse3.ROOT_INODE, pyfuse3.ROOT_INODE),
-    )
 
 
 def _scan_manifests(tg_client, block_store) -> dict[str, dict]:
@@ -135,17 +86,15 @@ def _write_db(db: sqlite3.Connection, manifests: dict[str, dict]) -> int:
     for path, manifest in manifests.items():
         parts        = path.split("/")
         leaf, dirs   = parts[-1], parts[:-1]
-        parent_inode = pyfuse3.ROOT_INODE
+        parent_inode = ROOT_INODE
 
         for dir_name in dirs:
             if dir_name:
-                parent_inode = _make_dir(db, cur, dir_name, parent_inode,
-                                         uid, gid, now_ns, dir_cache)
+                parent_inode = _make_dir(db, cur, dir_name, parent_inode, uid, gid, now_ns, dir_cache)
 
         cur.execute(
             "INSERT INTO inodes (uid,gid,mode,mtime_ns,atime_ns,ctime_ns,size) VALUES (?,?,?,?,?,?,?)",
-            (uid, gid, file_mode, manifest.get("mtime_ns", now_ns), now_ns, now_ns,
-             manifest.get("size", 0)),
+            (uid, gid, file_mode, manifest.get("mtime_ns", now_ns), now_ns, now_ns, manifest.get("size", 0)),
         )
         inode      = cur.lastrowid
         name_bytes = leaf.encode(errors="replace")
@@ -163,7 +112,7 @@ def _write_db(db: sqlite3.Connection, manifests: dict[str, dict]) -> int:
                 (alt, inode, parent_inode),
             )
 
-        hashes = manifest.get("hashes", {})
+        hashes = manifest.get("hashes", {})  # {block_idx: sha256_hex} — present in v3+ manifests
         for block_idx, msg_id in manifest.get("blocks", {}).items():
             sha256 = hashes.get(int(block_idx)) or hashes.get(str(block_idx))
             cur.execute(
@@ -222,8 +171,7 @@ def run_repair(tg_client, block_store, db_path: str = DB_PATH) -> int:
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     try:
-        _create_schema(db)
-        _insert_root(db)
+        init_schema(db)
         written = _write_db(db, manifests)
     except Exception as exc:
         db.close()
@@ -320,27 +268,49 @@ def run_sweep(tg_client, block_store, db_path: str = DB_PATH) -> int:
         return 0
 
     print("\n  Scanning channel for TelegramFS messages …")
-    all_tgfs_ids:   set[int]   = set()
+    print("  (data blocks are decrypted to verify they belong to TelegramFS)\n")
+    all_tgfs_ids: set[int]   = set()
+    naked_block_ids: set[int] = set()  # confirmed data blocks with no manifest
     manifests_seen: list[dict] = []
+    skipped_foreign = 0
 
     def _progress(sc, dl):
         print(f"\r  Scanned {sc:,} messages, {dl:,} with media …", end="", flush=True)
 
     for msg_id, raw in tg_client.iter_all_messages_raw(progress_cb=_progress):
-        if not raw.startswith(MANIFEST_MAGIC):
-            continue
-        manifest = block_store._decode_manifest(raw)
-        if manifest is None:
-            continue
-        all_tgfs_ids.add(msg_id)
-        manifest["meta_msg_id"] = msg_id
-        manifests_seen.append(manifest)
-        all_tgfs_ids.update(manifest.get("blocks", {}).values())
+        if raw.startswith(MANIFEST_MAGIC):
+            # It's a manifest — decode and collect referenced block IDs.
+            manifest = block_store._decode_manifest(raw)
+            if manifest is None:
+                continue
+            all_tgfs_ids.add(msg_id)
+            manifest["meta_msg_id"] = msg_id
+            manifests_seen.append(manifest)
+            all_tgfs_ids.update(manifest.get("blocks", {}).values())
+        else:
+            # Might be a data block (naked — no manifest, e.g. from a crashed upload).
+            # Try to decrypt: AES-GCM auth tag will reject foreign/corrupt data.
+            # Without encryption we accept anything <= BLOCK_SIZE as a data block.
+            try:
+                from block_store import BLOCK_SIZE
+                decrypted = block_store._decrypt(raw)
+                if len(decrypted) <= BLOCK_SIZE:
+                    all_tgfs_ids.add(msg_id)
+                    naked_block_ids.add(msg_id)
+                else:
+                    skipped_foreign += 1
+            except Exception:
+                # Decryption failed — not a TelegramFS block.
+                skipped_foreign += 1
 
     print()
+    if skipped_foreign:
+        print(f"  Skipped {skipped_foreign:,} non-TelegramFS message(s) (foreign media).")
+
     orphan_ids = sorted(all_tgfs_ids - live_ids)
 
     print(f"\n  TelegramFS messages on channel : {len(all_tgfs_ids):,}")
+    print(f"    of which naked data blocks   : {len(naked_block_ids):,}")
     print(f"  Referenced by live database   : {len(live_ids):,}")
     print(f"  Orphaned                      : {len(orphan_ids):,}")
 
@@ -348,6 +318,7 @@ def run_sweep(tg_client, block_store, db_path: str = DB_PATH) -> int:
         print("\n  ✓  Channel is clean — no orphans found.")
         return 0
 
+    # Classify orphans: manifests, their referenced blocks, naked data blocks.
     data_block_owners: dict[int, str] = {}
     for m in manifests_seen:
         path = m.get("path") or m.get("filename", "?")
@@ -355,17 +326,21 @@ def run_sweep(tg_client, block_store, db_path: str = DB_PATH) -> int:
             if block_msg_id in orphan_ids:
                 data_block_owners[block_msg_id] = path
 
-    manifest_orphans = [mid for mid in orphan_ids if mid not in data_block_owners]
-    data_orphans     = [mid for mid in orphan_ids if mid in data_block_owners]
+    manifest_orphans     = [mid for mid in orphan_ids if mid not in data_block_owners and mid not in naked_block_ids]
+    linked_block_orphans = [mid for mid in orphan_ids if mid in data_block_owners]
+    naked_block_orphans  = [mid for mid in orphan_ids if mid in naked_block_ids]
     print(f"\n  Orphan breakdown:")
-    print(f"    Orphaned manifests  : {len(manifest_orphans):,}")
-    print(f"    Orphaned data blocks: {len(data_orphans):,}")
+    print(f"    Orphaned manifests            : {len(manifest_orphans):,}")
+    print(f"    Orphaned blocks (has manifest) : {len(linked_block_orphans):,}")
+    print(f"    Naked blocks (crashed upload)  : {len(naked_block_orphans):,}")
 
     if len(orphan_ids) <= 30:
         print("\n  Orphan message IDs:")
         for mid in orphan_ids:
             if mid in data_block_owners:
                 print(f"    msg={mid}  data block for: {data_block_owners[mid]!r}")
+            elif mid in naked_block_ids:
+                print(f"    msg={mid}  naked data block (crashed upload)")
             else:
                 print(f"    msg={mid}  orphaned manifest")
 
