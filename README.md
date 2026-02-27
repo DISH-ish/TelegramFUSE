@@ -39,19 +39,19 @@ Before running this, I recommend creating a virtual environment in Python.
 - --debug and --debug-fuse   | --debug to debug python and --debug-fuse flushes every communication with the kernel
 ## .env Breakdown
 
-APP_ID=
-APP_HASH=                  You can get these from https://my.telegram.org/myapp. **AGAIN, storing large amounts of files could get you banned. So be careful and take precautions if you care about losing your account.**
-CHANNEL_LINK=              the link to your Telegram channel (https://t.me/foo)
-ENCRYPTION_KEY=            64-char hex string, gets automatically generated if you choose so also you can put your own to decrypt the data
-SESSION_NAME=              this can be whatever you want, just the name that will be used for the file storing details of your Telegram session
-LOCAL_ADDR=                optional,default: default interface, you can set the ip of an interface you want to use, doesn't support ipv6 i think
-CACHE_MAX_BLOCKS=          optional,default: 1280=5 GiB worth of 4 MB blocks
-MAX_CONCURRENT_UPLOADS=    optional,default: 4
-MAX_CONCURRENT_DOWNLOADS=  optional,default: 4
-DELETE_BATCH_DELAY=        optional,default: 30, every xx seconds it deletes the data from the telegram that is deleted in the folder
-VERIFY_CONTENT=
-MAX_VERIFY_RETRIES=
-
+- APP_ID=
+- APP_HASH=                  You can get these from https://my.telegram.org/myapp. **AGAIN, storing large amounts of files could get you banned. So be careful and - take precautions if you care about losing your account.**
+- CHANNEL_LINK=              the link to your Telegram channel (https://t.me/foo)
+- ENCRYPTION_KEY=            64-char hex string, gets automatically generated if you choose so also you can put your own to decrypt the data
+- SESSION_NAME=              this can be whatever you want, just the name that will be used for the file storing details of your Telegram session
+- LOCAL_ADDR=                optional,default: default interface, you can set the ip of an interface you want to use, doesn't support ipv6 i think
+- CACHE_MAX_BLOCKS=          optional,default: 1280=5 GiB worth of 4 MB blocks
+- MAX_CONCURRENT_UPLOADS=    optional,default: 4
+- MAX_CONCURRENT_DOWNLOADS=  optional,default: 4
+- DELETE_BATCH_DELAY=        optional,default: 30, every xx seconds it deletes the data from the telegram that is deleted in the folder
+- VERIFY_CONTENT=
+- MAX_VERIFY_RETRIES=
+- BLOCK_SIZE_MB=             optional,default: 10
 # TO UNMOUNT, IF SOMETHING BREAKS
 `fusermount -u <path/of/your/mount>`
 
